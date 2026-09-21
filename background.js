@@ -3,6 +3,15 @@
 // 定时器名称
 const ALARM_NAME = 'tokenRefresh';
 
+const FLOW_URL = 'https://flow.google.com/';
+const MODERN_FLOW_COOKIE_NAMES = new Set(['OSID', '__Secure-OSID']);
+const GOOGLE_ACCOUNT_COOKIE_NAMES = new Set(['SID', 'HSID', 'SSID', 'APISID', 'SAPISID']);
+const COOKIE_QUERIES = [
+    { label: 'Flow新版页面', query: { url: FLOW_URL } },
+    { label: 'Flow新版域名', query: { domain: 'flow.google.com' } },
+    { label: 'Google账号域名', query: { domain: '.google.com' } }
+];
+
 // 日志系统
 const Logger = {
     async log(level, message, details = null) {
@@ -131,6 +140,159 @@ async function setupAlarm() {
     await Logger.info(`Alarm set to ${intervalMinutes} minutes`);
 }
 
+function sleep(milliseconds) {
+    return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+function waitForTabReady(tabId, timeoutMs = 15000) {
+    return new Promise((resolve) => {
+        let settled = false;
+
+        const finish = () => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            clearTimeout(timer);
+            chrome.tabs.onUpdated.removeListener(onUpdated);
+            resolve();
+        };
+
+        const onUpdated = (updatedTabId, changeInfo) => {
+            if (updatedTabId === tabId && changeInfo.status === 'complete') {
+                finish();
+            }
+        };
+
+        const timer = setTimeout(finish, timeoutMs);
+        chrome.tabs.onUpdated.addListener(onUpdated);
+        chrome.tabs.get(tabId).then((currentTab) => {
+            if (currentTab && currentTab.status === 'complete') {
+                finish();
+            }
+        }).catch(finish);
+    });
+}
+
+function normalizeCookieDomain(domain) {
+    return String(domain || '').replace(/^\./, '').toLowerCase();
+}
+
+function cookieKey(cookie) {
+    const partitionSite = cookie.partitionKey && cookie.partitionKey.topLevelSite
+        ? cookie.partitionKey.topLevelSite
+        : '';
+    return [cookie.name, cookie.domain, cookie.path, cookie.storeId, partitionSite].join('\u0000');
+}
+
+function deduplicateCookies(cookies) {
+    return Array.from(new Map(cookies.map(cookie => [cookieKey(cookie), cookie])).values());
+}
+
+function isGoogleCookieDomain(domain) {
+    const normalizedDomain = normalizeCookieDomain(domain);
+    return normalizedDomain === 'google.com' || normalizedDomain.endsWith('.google.com');
+}
+
+function isGoogleAccountCookieDomain(domain) {
+    const normalizedDomain = normalizeCookieDomain(domain);
+    return normalizedDomain === 'google.com' || normalizedDomain === 'accounts.google.com';
+}
+
+function cookiePreferenceScore(cookie) {
+    const domain = normalizeCookieDomain(cookie.domain);
+    let score = String(cookie.path || '').length;
+
+    if (MODERN_FLOW_COOKIE_NAMES.has(cookie.name) && domain === 'flow.google.com') {
+        score += 10000;
+    }
+    if (GOOGLE_ACCOUNT_COOKIE_NAMES.has(cookie.name)) {
+        if (domain === 'google.com') {
+            score += 10000;
+        } else if (domain === 'accounts.google.com') {
+            score += 9000;
+        }
+    }
+
+    return score;
+}
+
+function buildCookieHeader(cookies) {
+    const selectedCookies = new Map();
+
+    for (const cookie of cookies) {
+        if (!cookie.name || !cookie.value) {
+            continue;
+        }
+
+        const domain = normalizeCookieDomain(cookie.domain);
+        const isRelevantDomain = domain === 'flow.google.com' || isGoogleCookieDomain(domain);
+
+        if (!isRelevantDomain) {
+            continue;
+        }
+
+        const existing = selectedCookies.get(cookie.name);
+        const cookieScore = cookiePreferenceScore(cookie);
+        const existingScore = existing ? cookiePreferenceScore(existing) : -1;
+        if (!existing || cookieScore > existingScore) {
+            selectedCookies.set(cookie.name, cookie);
+        }
+    }
+
+    return Array.from(selectedCookies.values())
+        .map(cookie => `${cookie.name}=${cookie.value}`)
+        .join('; ');
+}
+
+async function collectRelevantCookies() {
+    const cookies = [];
+
+    for (const source of COOKIE_QUERIES) {
+        try {
+            const found = await chrome.cookies.getAll(source.query);
+            cookies.push(...found);
+            await Logger.info(`从${source.label}找到 ${found.length} 个cookies`);
+        } catch (error) {
+            await Logger.error(`读取${source.label} cookies失败`, { error: error.message });
+        }
+    }
+
+    return deduplicateCookies(cookies);
+}
+
+async function closeTemporaryTab(tab) {
+    if (!tab || typeof tab.id !== 'number') {
+        return;
+    }
+
+    try {
+        await chrome.tabs.remove(tab.id);
+        await Logger.info('标签页已关闭');
+    } catch (error) {
+        await Logger.info('临时标签页已不存在');
+    }
+}
+
+function parseServerErrorMessage(responseText) {
+    const raw = String(responseText || '').trim();
+    if (!raw) {
+        return '';
+    }
+
+    try {
+        const payload = JSON.parse(raw);
+        const message = payload.detail || payload.message || payload.error;
+        if (typeof message === 'string') {
+            return message.slice(0, 300);
+        }
+    } catch (error) {
+        // 非JSON响应直接使用截断后的文本
+    }
+
+    return raw.slice(0, 300);
+}
+
 // 提取cookie并发送到服务器
 async function extractAndSendToken() {
     let tab = null;
@@ -148,88 +310,57 @@ async function extractAndSendToken() {
 
         await Logger.info('配置已加载', { apiUrl: config.apiUrl });
 
-        // 1. 打开Google Labs页面（在后台）
-        await Logger.info('正在打开Google Labs页面...');
+        // 1. 打开新版Flow页面（在后台），让浏览器刷新当前登录态
+        await Logger.info('正在打开Google Flow页面...');
         tab = await chrome.tabs.create({
-            url: 'https://labs.google/fx/vi/tools/flow',
+            url: FLOW_URL,
             active: false
         });
 
         await Logger.info('页面已创建，等待加载...', { tabId: tab.id });
 
-        // 等待页面完全加载
-        await new Promise((resolve) => {
-            const listener = (tabId, changeInfo) => {
-                if (tabId === tab.id && changeInfo.status === 'complete') {
-                    chrome.tabs.onUpdated.removeListener(listener);
-                    resolve();
-                }
-            };
-            chrome.tabs.onUpdated.addListener(listener);
-        });
+        await waitForTabReady(tab.id);
 
         await Logger.info('页面加载完成，等待JavaScript执行...');
 
-        // 增加等待时间到5秒，确保JavaScript完全执行
-        await new Promise(resolve => setTimeout(resolve, 5000));
+        await sleep(5000);
 
         await Logger.info('开始提取Cookies...');
 
-        // 2. 获取session-token
-        let sessionToken = null;
-        let allCookiesFound = [];
-
-        // 尝试获取所有google相关的cookies
-        try {
-            // 方法1: 获取当前标签页的所有cookies
-            const tabCookies = await chrome.cookies.getAll({ url: 'https://labs.google/fx/vi/tools/flow' });
-            allCookiesFound.push(...tabCookies);
-            await Logger.info(`从标签页URL找到 ${tabCookies.length} 个cookies`);
-
-            // 方法2: 获取labs.google域名下的所有cookies
-            const labsCookies = await chrome.cookies.getAll({ domain: 'labs.google' });
-            allCookiesFound.push(...labsCookies);
-            await Logger.info(`从labs.google域名找到 ${labsCookies.length} 个cookies`);
-
-            // 方法3: 获取.google.com域名下的所有cookies
-            const googleCookies = await chrome.cookies.getAll({ domain: '.google.com' });
-            allCookiesFound.push(...googleCookies);
-            await Logger.info(`从.google.com域名找到 ${googleCookies.length} 个cookies`);
-
-        } catch (err) {
-            await Logger.error('获取cookies失败', { error: err.message });
-        }
-
-        // 去重所有找到的cookies
-        const uniqueCookies = Array.from(
-            new Map(allCookiesFound.map(c => [c.name + c.domain, c])).values()
-        );
+        // 2. 提取新版Flow会话与Google账号Cookie
+        const uniqueCookies = await collectRelevantCookies();
 
         await Logger.info(`总共找到 ${uniqueCookies.length} 个唯一cookies`, {
             cookieNames: uniqueCookies.map(c => ({ name: c.name, domain: c.domain }))
         });
 
-        // 查找session-token
-        for (const cookie of uniqueCookies) {
-            if (cookie.name === '__Secure-next-auth.session-token' && !sessionToken) {
-                sessionToken = cookie.value;
-                await Logger.success('找到session-token', {
-                    domain: cookie.domain,
-                    path: cookie.path,
-                    length: sessionToken.length
-                });
-                break;
-            }
+        const modernFlowCookie = uniqueCookies.find(cookie => (
+            MODERN_FLOW_COOKIE_NAMES.has(cookie.name)
+            && normalizeCookieDomain(cookie.domain) === 'flow.google.com'
+            && cookie.value
+        ));
+        const googleAccountCookie = uniqueCookies.find(cookie => (
+            GOOGLE_ACCOUNT_COOKIE_NAMES.has(cookie.name)
+            && isGoogleAccountCookieDomain(cookie.domain)
+            && cookie.value
+        ));
+        const googleCookies = buildCookieHeader(uniqueCookies);
+
+        if (modernFlowCookie) {
+            await Logger.success('找到新版Flow Cookie', {
+                name: modernFlowCookie.name,
+                domain: modernFlowCookie.domain,
+                path: modernFlowCookie.path,
+                length: modernFlowCookie.value.length
+            });
         }
 
         // 关闭标签页
-        if (tab) {
-            await chrome.tabs.remove(tab.id);
-            await Logger.info('标签页已关闭');
-        }
+        await closeTemporaryTab(tab);
+        tab = null;
 
-        if (!sessionToken) {
-            await Logger.error('未找到session-token', {
+        if (!modernFlowCookie) {
+            await Logger.error('未找到Flow登录Cookie', {
                 foundCookies: uniqueCookies.map(c => ({
                     name: c.name,
                     domain: c.domain
@@ -238,14 +369,37 @@ async function extractAndSendToken() {
 
             return {
                 success: false,
-                error: '未找到session-token。请确保已登录Google Labs。'
+                error: '未找到Flow登录Cookie。请先登录Google Flow，并确认首页或项目页可以正常打开。'
             };
         }
 
-        await Logger.info('Session-token提取成功', { tokenLength: sessionToken.length });
+        if (modernFlowCookie && !googleAccountCookie) {
+            await Logger.error('未找到Google账号Cookie', {
+                requiredNames: Array.from(GOOGLE_ACCOUNT_COOKIE_NAMES)
+            });
+            return {
+                success: false,
+                error: '已找到新版Flow会话，但未读取到Google账号Cookie。请重新登录Google后再试。'
+            };
+        }
 
-        // 4. 发送到服务器
+        if (!googleCookies) {
+            await Logger.error('Cookie序列化失败');
+            return { success: false, error: '未生成可同步的Cookie数据。' };
+        }
+
+        await Logger.info('Flow Cookie提取成功', {
+            mode: 'modern-cookie',
+            cookieCount: googleCookies.split('; ').length
+        });
+
+        // 3. 发送到服务器
         await Logger.info('正在发送到服务器...');
+
+        const payload = {
+            google_cookies: googleCookies,
+            protocol_mode: 'protocol'
+        };
 
         const response = await fetch(config.apiUrl, {
             method: 'POST',
@@ -253,18 +407,23 @@ async function extractAndSendToken() {
                 'Content-Type': 'application/json',
                 'Authorization': `Bearer ${config.connectionToken}`
             },
-            body: JSON.stringify({
-                session_token: sessionToken
-            })
+            body: JSON.stringify(payload)
         });
 
         if (!response.ok) {
             const errorText = await response.text();
+            const serverError = parseServerErrorMessage(errorText);
             await Logger.error('服务器错误', {
                 status: response.status,
-                error: errorText
+                error: serverError
             });
-            return { success: false, error: `服务器错误: ${response.status}` };
+
+            return {
+                success: false,
+                error: serverError
+                    ? `服务器错误 ${response.status}: ${serverError}`
+                    : `服务器错误: ${response.status}`
+            };
         }
 
         const result = await response.json();
@@ -299,14 +458,7 @@ async function extractAndSendToken() {
             stack: error.stack
         });
 
-        // 确保关闭标签页
-        if (tab) {
-            try {
-                await chrome.tabs.remove(tab.id);
-            } catch (e) {
-                // 忽略关闭标签页的错误
-            }
-        }
+        await closeTemporaryTab(tab);
 
         return { success: false, error: error.message };
     }
