@@ -4,11 +4,15 @@
 const ALARM_NAME = 'tokenRefresh';
 
 const FLOW_URL = 'https://flow.google.com/';
+const LEGACY_FLOW_URL = 'https://labs.google/fx/tools/flow';
+const LEGACY_SESSION_COOKIE_NAME = '__Secure-next-auth.session-token';
 const MODERN_FLOW_COOKIE_NAMES = new Set(['OSID', '__Secure-OSID']);
 const GOOGLE_ACCOUNT_COOKIE_NAMES = new Set(['SID', 'HSID', 'SSID', 'APISID', 'SAPISID']);
 const COOKIE_QUERIES = [
     { label: 'Flow新版页面', query: { url: FLOW_URL } },
     { label: 'Flow新版域名', query: { domain: 'flow.google.com' } },
+    { label: 'Flow旧版会话', query: { url: LEGACY_FLOW_URL } },
+    { label: 'Flow旧版域名', query: { domain: 'labs.google' } },
     { label: 'Google账号域名', query: { domain: '.google.com' } }
 ];
 
@@ -301,7 +305,7 @@ async function extractAndSendToken() {
         await Logger.info('开始提取Token...');
 
         // 获取配置
-        const config = await chrome.storage.sync.get(['apiUrl', 'connectionToken']);
+        const config = await chrome.storage.sync.get(['apiUrl', 'connectionToken', 'loginAccount']);
 
         if (!config.apiUrl || !config.connectionToken) {
             await Logger.error('配置未设置');
@@ -339,12 +343,17 @@ async function extractAndSendToken() {
             && normalizeCookieDomain(cookie.domain) === 'flow.google.com'
             && cookie.value
         ));
+        const legacySessionCookie = uniqueCookies.find(cookie => (
+            cookie.name === LEGACY_SESSION_COOKIE_NAME
+            && normalizeCookieDomain(cookie.domain) === 'labs.google'
+            && cookie.value
+        ));
         const googleAccountCookie = uniqueCookies.find(cookie => (
             GOOGLE_ACCOUNT_COOKIE_NAMES.has(cookie.name)
             && isGoogleAccountCookieDomain(cookie.domain)
             && cookie.value
         ));
-        const googleCookies = buildCookieHeader(uniqueCookies);
+        const googleCookies = googleAccountCookie ? buildCookieHeader(uniqueCookies) : '';
 
         if (modernFlowCookie) {
             await Logger.success('找到新版Flow Cookie', {
@@ -354,12 +363,19 @@ async function extractAndSendToken() {
                 length: modernFlowCookie.value.length
             });
         }
+        if (legacySessionCookie) {
+            await Logger.success('找到旧版Flow Session Token', {
+                domain: legacySessionCookie.domain,
+                path: legacySessionCookie.path,
+                length: legacySessionCookie.value.length
+            });
+        }
 
         // 关闭标签页
         await closeTemporaryTab(tab);
         tab = null;
 
-        if (!modernFlowCookie) {
+        if (!modernFlowCookie && !legacySessionCookie) {
             await Logger.error('未找到Flow登录Cookie', {
                 foundCookies: uniqueCookies.map(c => ({
                     name: c.name,
@@ -373,7 +389,7 @@ async function extractAndSendToken() {
             };
         }
 
-        if (modernFlowCookie && !googleAccountCookie) {
+        if (!legacySessionCookie && modernFlowCookie && !googleAccountCookie) {
             await Logger.error('未找到Google账号Cookie', {
                 requiredNames: Array.from(GOOGLE_ACCOUNT_COOKIE_NAMES)
             });
@@ -383,23 +399,32 @@ async function extractAndSendToken() {
             };
         }
 
-        if (!googleCookies) {
+        if (!legacySessionCookie && !googleCookies) {
             await Logger.error('Cookie序列化失败');
             return { success: false, error: '未生成可同步的Cookie数据。' };
         }
 
         await Logger.info('Flow Cookie提取成功', {
-            mode: 'modern-cookie',
-            cookieCount: googleCookies.split('; ').length
+            mode: legacySessionCookie ? 'session-token' : 'modern-cookie',
+            hasSessionToken: Boolean(legacySessionCookie),
+            cookieCount: googleCookies ? googleCookies.split('; ').length : 0
         });
 
         // 3. 发送到服务器
         await Logger.info('正在发送到服务器...');
 
         const payload = {
-            google_cookies: googleCookies,
-            protocol_mode: 'protocol'
+            protocol_mode: googleCookies ? 'protocol' : 'session'
         };
+        if (legacySessionCookie) {
+            payload.session_token = legacySessionCookie.value;
+        }
+        if (googleCookies) {
+            payload.google_cookies = googleCookies;
+        }
+        if (config.loginAccount) {
+            payload.login_account = String(config.loginAccount).trim();
+        }
 
         const response = await fetch(config.apiUrl, {
             method: 'POST',

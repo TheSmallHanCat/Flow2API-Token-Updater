@@ -133,6 +133,12 @@
     </div>
 
     <div class="form-group">
+        <label for="loginAccount">Google账号（可选）</label>
+        <input type="text" id="loginAccount" placeholder="name@example.com">
+        <div class="hint">多账号登录时建议填写，用于选择正确的Google账号</div>
+    </div>
+
+    <div class="form-group">
         <label for="refreshInterval">刷新间隔（分钟）</label>
         <input type="number" id="refreshInterval" value="60" min="1" max="1440">
         <div class="hint">建议设置为60分钟（1小时）</div>
@@ -155,8 +161,8 @@
         <strong>📌 使用说明：</strong><br>
         1. 在Flow2API管理后台获取连接接口和Token<br>
         2. 填写配置并保存<br>
-        3. 插件将自动定时提取Google Flow的登录Cookie<br>
-        4. 提取的cookie会自动更新到Flow2API系统
+        3. 多账号浏览器建议填写当前Flow账号邮箱<br>
+        4. 插件将自动同步Flow登录态到Flow2API系统
     </div>
 
     <script src="popup.js"></script>

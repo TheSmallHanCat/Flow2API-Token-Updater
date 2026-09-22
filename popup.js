@@ -2,13 +2,16 @@
 
 document.addEventListener('DOMContentLoaded', async () => {
     // 加载已保存的配置
-    const config = await chrome.storage.sync.get(['apiUrl', 'connectionToken', 'refreshInterval']);
+    const config = await chrome.storage.sync.get(['apiUrl', 'connectionToken', 'loginAccount', 'refreshInterval']);
 
     if (config.apiUrl) {
         document.getElementById('apiUrl').value = config.apiUrl;
     }
     if (config.connectionToken) {
         document.getElementById('connectionToken').value = config.connectionToken;
+    }
+    if (config.loginAccount) {
+        document.getElementById('loginAccount').value = config.loginAccount;
     }
     if (config.refreshInterval) {
         document.getElementById('refreshInterval').value = config.refreshInterval;
@@ -18,6 +21,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('saveBtn').addEventListener('click', async () => {
         const apiUrl = document.getElementById('apiUrl').value.trim();
         const connectionToken = document.getElementById('connectionToken').value.trim();
+        const loginAccount = document.getElementById('loginAccount').value.trim();
         const refreshInterval = parseInt(document.getElementById('refreshInterval').value);
 
         if (!apiUrl || !connectionToken) {
@@ -34,13 +38,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         await chrome.storage.sync.set({
             apiUrl,
             connectionToken,
+            loginAccount,
             refreshInterval
         });
 
         // 通知background script更新定时器
         chrome.runtime.sendMessage({
             action: 'updateConfig',
-            config: { apiUrl, connectionToken, refreshInterval }
+            config: { apiUrl, connectionToken, loginAccount, refreshInterval }
         });
 
         showStatus('配置保存成功！', 'success');

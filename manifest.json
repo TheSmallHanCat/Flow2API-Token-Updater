@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Flow2API Token Updater",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "自动提取Google Flow登录Cookie并更新到Flow2API系统",
   "permissions": [
     "cookies",
@@ -12,6 +12,7 @@
     "notifications"
   ],
   "host_permissions": [
+    "https://labs.google/*",
     "https://google.com/*",
     "https://*.google.com/*"
   ],
